@@ -1,0 +1,22 @@
+#!/bin/sh
+# Ajustes dentro de la imagen (se ejecuta durante lb build).
+set -e
+chmod 755 /opt/alamo/alamo_wipe.py
+
+# La aplicacion ocupa tty1 en lugar del inicio de sesion normal.
+systemctl enable alamo-wipe.service
+systemctl mask getty@tty1.service
+
+# Equipos con Windows guardan el reloj (RTC) en hora local.
+printf '0.0 0 0.0\n0\nLOCAL\n' > /etc/adjtime
+ln -sf /usr/share/zoneinfo/America/Mexico_City /etc/localtime
+echo "America/Mexico_City" > /etc/timezone
+
+# Idioma
+sed -i 's/^# *es_MX.UTF-8/es_MX.UTF-8/' /etc/locale.gen
+locale-gen
+systemctl enable systemd-timesyncd.service || true
+systemctl enable NetworkManager.service || true
+
+# Reducir tamano
+rm -rf /usr/share/doc/* /usr/share/man/* /var/cache/apt/archives/*.deb

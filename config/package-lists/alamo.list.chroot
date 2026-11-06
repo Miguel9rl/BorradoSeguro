@@ -1,0 +1,47 @@
+# --- Arranque con Secure Boot activo (shim y GRUB firmados) ---
+shim-signed
+grub-efi-amd64-signed
+
+# --- Borrado e inventario de hardware ---
+nvme-cli
+hdparm
+smartmontools
+sg3-utils
+dmidecode
+pciutils
+usbutils
+util-linux
+util-linux-extra
+coreutils
+kbd
+
+# --- Interfaz de texto ---
+whiptail
+console-setup
+keyboard-configuration
+locales
+
+# --- Red (cable y Wi-Fi) ---
+network-manager
+wpasupplicant
+iw
+ca-certificates
+systemd-timesyncd
+curl
+
+# --- Firmware de red Intel / Realtek / Qualcomm (equipos Dell) ---
+firmware-realtek
+firmware-iwlwifi
+firmware-atheros
+firmware-misc-nonfree
+
+# --- Certificado PDF ---
+python3
+fonts-liberation
+fonts-dejavu-core
+
+# --- Soporte ---
+less
+nano
+dosfstools
+exfatprogs

@@ -1,0 +1,23 @@
+name: Construir ISO Alamo Borrado Seguro
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  iso:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Construir en contenedor Debian trixie
+        run: docker run --rm --privileged -v "$PWD":/work -w /work debian:trixie ./build-iso.sh
+      - name: Publicar ISO como artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: alamo-borrado-seguro-iso
+          path: |
+            salida/*.iso
+            salida/*.sha256
+          retention-days: 30

@@ -1,0 +1,22 @@
+[Unit]
+Description=Alamo Seguros - Borrado Seguro (interfaz en tty1)
+After=systemd-user-sessions.service live-config.service NetworkManager.service
+Conflicts=getty@tty1.service
+
+[Service]
+Type=simple
+ExecStartPre=-/bin/sleep 2
+ExecStart=/usr/bin/python3 /opt/alamo/alamo_wipe.py
+Environment=LANG=es_MX.UTF-8 TERM=linux PYTHONUNBUFFERED=1
+StandardInput=tty-force
+StandardOutput=tty
+StandardError=tty
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
