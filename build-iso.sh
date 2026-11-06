@@ -34,10 +34,12 @@ lb config
 lb build
 
 ISO=$(ls -1 *.iso | head -1)
-mkdir -p ../salida
-DEST="../salida/alamo-borrado-seguro-$(date +%Y%m%d).iso"
-mv "$ISO" "$DEST"
-cd ..
-sha256sum "$DEST" | tee "$DEST.sha256"
-ls -lh "$DEST"
-echo "==> ISO lista: $DEST"
+SALIDA="$(cd .. && pwd)/salida"
+mkdir -p "$SALIDA"
+NOMBRE="alamo-borrado-seguro-$(date +%Y%m%d).iso"
+mv "$ISO" "$SALIDA/$NOMBRE"
+cp build.log "$SALIDA/" 2>/dev/null || true
+cd "$SALIDA"
+sha256sum "$NOMBRE" | tee "$NOMBRE.sha256"
+ls -lh "$NOMBRE"
+echo "==> ISO lista: salida/$NOMBRE"
