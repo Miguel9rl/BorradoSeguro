@@ -16,7 +16,7 @@ TTYReset=yes
 TTYVHangup=yes
 TTYVTDisallocate=yes
 Restart=always
-RestartSec=2
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target

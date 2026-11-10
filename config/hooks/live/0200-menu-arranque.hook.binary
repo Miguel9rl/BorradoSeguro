@@ -1,0 +1,50 @@
+#!/bin/sh
+# Personaliza el menu de arranque (GRUB para UEFI e ISOLINUX para BIOS legado).
+# Se ejecuta dentro de la carpeta binary/ despues de generar los menus y antes de crear la ISO,
+# por eso funciona sin depender de las plantillas internas de live-build.
+# Nota: los textos van sin acentos porque la fuente de GRUB puede no incluir esos caracteres.
+set -e
+
+TITULO_PRINCIPAL="Alamo Seguros - Borrado Seguro"
+TITULO_SEGURO="Alamo Seguros - Modo compatible (si la opcion principal falla)"
+ENCABEZADO="Alamo Seguros - Borrado Seguro NIST SP 800-88"
+SEGUNDOS=5
+
+echo "P: Personalizando menu de arranque..."
+
+# ---------- GRUB (UEFI) ----------
+for f in $(find boot/grub -name '*.cfg' 2>/dev/null); do
+    sed -i \
+        -e "s/Live system ([a-z0-9_]* fail-safe mode)/${TITULO_SEGURO}/g" \
+        -e "s/Live system ([a-z0-9_]*)/${TITULO_PRINCIPAL}/g" \
+        -e "s/^\([[:space:]]*\)set timeout=.*/\1set timeout=${SEGUNDOS}/" \
+        "$f"
+done
+# Titulo del tema grafico ("Debian GNU/Linux ...").
+for t in $(find boot/grub -name 'theme.txt' 2>/dev/null); do
+    sed -i "s|^title-text:.*|title-text: \"${ENCABEZADO}\"|" "$t"
+done
+# Al final de grub.cfg: gana sobre cualquier valor previo, arranca la primera opcion.
+if [ -f boot/grub/grub.cfg ]; then
+    printf '\n# Alamo Seguros\nset default=0\nset timeout_style=menu\nset timeout=%s\n' "$SEGUNDOS" >> boot/grub/grub.cfg
+fi
+
+# ---------- ISOLINUX (BIOS legado) ----------
+for f in $(find isolinux syslinux -name '*.cfg' 2>/dev/null); do
+    sed -i \
+        -e "s/Live system ([a-z0-9_]* fail-safe mode)/${TITULO_SEGURO}/g" \
+        -e "s/Live system ([a-z0-9_]*)/${TITULO_PRINCIPAL}/g" \
+        -e "s/^\([[:space:]]*\)timeout .*/\1timeout $((SEGUNDOS * 10))/I" \
+        -e "s/^\([[:space:]]*\)menu title .*/\1menu title ${ENCABEZADO}/I" \
+        "$f"
+done
+for f in isolinux/isolinux.cfg syslinux/syslinux.cfg; do
+    if [ -f "$f" ] && ! grep -qi '^[[:space:]]*timeout' "$f"; then
+        printf 'timeout %s\n' "$((SEGUNDOS * 10))" >> "$f"
+    fi
+done
+
+# Evidencia en el log de construccion.
+echo "P: Entradas del menu resultantes:"
+grep -rh "menuentry\|menu label" boot/grub isolinux 2>/dev/null | sed 's/^[[:space:]]*/    /' | head -20 || true
+grep -rh "set timeout\|^timeout" boot/grub isolinux 2>/dev/null | sed 's/^[[:space:]]*/    /' || true
