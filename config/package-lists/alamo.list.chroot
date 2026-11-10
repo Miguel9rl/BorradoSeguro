@@ -15,6 +15,9 @@ util-linux-extra
 coreutils
 kbd
 
+# --- Prueba de recuperacion (PhotoRec viene en el paquete testdisk) ---
+testdisk
+
 # --- Interfaz de texto ---
 whiptail
 console-setup

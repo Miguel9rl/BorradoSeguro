@@ -53,7 +53,7 @@ No use Ventoy: obliga a registrar una llave MOK en cada equipo para arrancar con
 2. Encienda y pulse **F12** → elija la USB en *UEFI Boot*.
 3. La interfaz arranca sola:
    - **Red**: si no hay cable, elija *Conectar a Wi-Fi* o *Continuar sin red* (el envío queda pendiente en la USB y se manda solo en el siguiente arranque con red).
-   - **Menú**: 1 Borrado · 2 Simulación · 3 Diagnóstico · 4 Red/reenvío · 5 Consola · 6 Apagar · 7 Reiniciar.
+   - **Menú**: 1 Borrado · 2 Simulación · 3 Prueba de recuperación · 4 Diagnóstico · 5 Red/reenvío · 6 Consola · 7 Apagar · 8 Reiniciar.
    - **Selección**: marque discos con **Espacio**, Enter para continuar. La USB de arranque nunca aparece.
    - **Confirmación**: escriba `BORRAR`.
 4. Al terminar verá el resultado; el certificado queda en `Reportes_Borrado_Seguro\` de la USB.
@@ -65,7 +65,8 @@ No use Ventoy: obliga a registrar una llave MOK en cada equipo para arrancar con
 | `Reportes_Borrado_Seguro\Certificado_BorradoSeguro_<serie>_<fecha>.pdf` | Certificado |
 | `…_datos.json` | Datos completos del certificado (para auditoría y verificación de la huella) |
 | `Log_<serie>_<fecha>.txt` | Bitácora de la ejecución |
-| `Diagnostico_<serie>_<fecha>.txt` | Resultado de la opción 3 |
+| `Diagnostico_<serie>_<fecha>.txt` | Resultado del diagnóstico |
+| `Evidencia_PruebaRecuperacion_<serie>_<fecha>.pdf` | Prueba de recuperación (opcional) |
 | `Pendientes_Envio\` | Envíos que no se pudieron hacer; `enviados\` guarda los ya mandados |
 
 ## 4. Qué hace con cada disco
@@ -84,6 +85,17 @@ Las capacidades se leen como bits (`sanicap`, `fna`, `oacs` en NVMe; bloque *Sec
 **Verificación**: antes del borrado se leen 32 muestras de 64 KiB (inicio, mitad, final y posiciones aleatorias) y se guarda su SHA-256. Después se releen sin caché (`O_DIRECT`). Si alguna muestra que tenía datos queda igual, el disco se marca **Fallido**. Si el disco ya estaba vacío, la verificación sale "No concluyente" y el resultado se basa en la confirmación del firmware.
 
 **Estados**: *Exitoso* (método OK + verificación aprobada o no concluyente) · *Parcial* (sobrescritura en SSD) · *Fallido* (ningún método funcionó o la verificación detectó datos).
+
+## 4.1 Prueba de recuperación (opcional, evidencia aparte)
+
+Al terminar un borrado real, la interfaz ofrece una prueba de recuperación. También está en el menú principal (**3 Prueba de recuperación**) para hacerla después. Ninguna de las dos pruebas escribe en el disco.
+
+| Prueba | Qué hace | Tiempo |
+|---|---|---|
+| **Rápida** | Sin particiones ni firmas (`wipefs`); lee el primer 512 MiB, los últimos 64 MiB y 2048 bloques aleatorios buscando NTFS, BitLocker, FAT/exFAT, GPT, MFT y cabeceras de PDF, Office, Outlook, imágenes, comprimidos, registro de Windows, SQLite y video | ~1 min |
+| **Completa** | PhotoRec sobre todo el disco (más de 400 tipos de archivo). Lo recuperado va solo a memoria RAM y se elimina; se registra únicamente cantidad y tipo. Se detiene sola si supera 200 archivos | NVMe 3–10 min · SSD SATA 10–20 min · HDD 1.5–3 h |
+
+El resultado se guarda en la USB como `Evidencia_PruebaRecuperacion_<serie>_<fecha>.pdf` (+ `_datos.json`), con el folio del certificado de referencia. **No modifica el certificado ni se envía a Power Automate.** Resultado esperado tras un borrado correcto: ninguna firma y 0 archivos recuperados.
 
 ## 5. Power Automate
 
@@ -113,7 +125,7 @@ Debe coincidir con el PDF y con la columna `huella` registrada en SharePoint.
 
 1. En 2–3 modelos Dell distintos (uno viejo y uno reciente), arrancar y ejecutar **3 Diagnóstico**. Revisar el `.txt`: Secure Boot, discos detectados, métodos y estado *frozen*.
 2. Ejecutar **2 Simulación** y revisar el PDF y el log.
-3. Borrado real en un equipo de prueba. Después, arrancar de nuevo, abrir **5 Consola** y comprobar, por ejemplo, `hexdump -C /dev/nvme0n1 | head` (sin tabla de particiones ni datos).
+3. Borrado real en un equipo de prueba con archivos reconocibles y, al terminar, elegir la prueba **Ambas**: debe dar 0 firmas y 0 archivos recuperados.
 4. Probar sin red → arrancar con red → confirmar que el pendiente llega a SharePoint.
 
 ## Modo línea de comandos (desde la consola de soporte)
@@ -122,4 +134,5 @@ Debe coincidir con el PDF y con la columna `huella` registrada en SharePoint.
 python3 /opt/alamo/alamo_wipe.py --diagnostico
 python3 /opt/alamo/alamo_wipe.py --disco /dev/nvme0n1 --simulacion
 python3 /opt/alamo/alamo_wipe.py --disco /dev/nvme0n1 --confirmar BORRAR
+python3 /opt/alamo/alamo_wipe.py --disco /dev/nvme0n1 --prueba ambas      # solo prueba de recuperación
 ```
