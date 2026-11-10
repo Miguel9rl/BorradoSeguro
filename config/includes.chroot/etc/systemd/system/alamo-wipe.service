@@ -4,7 +4,7 @@ After=systemd-user-sessions.service live-config.service NetworkManager.service
 Conflicts=getty@tty1.service
 
 [Service]
-Type=simple
+Type=idle
 ExecStartPre=-/bin/sleep 2
 ExecStart=/usr/bin/python3 /opt/alamo/alamo_wipe.py
 Environment=LANG=es_MX.UTF-8 TERM=linux PYTHONUNBUFFERED=1
