@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Alamo Seguros TI - Borrado Seguro de Discos y Certificacion (NIST SP 800-88 Rev. 1)
-
+ 
 Se ejecuta dentro de la ISO Debian Live. Flujo:
   1. Prepara la USB (particion FAT32 creada por Rufus) para guardar reportes y lee alamo-wipe.conf.
   2. Red: verifica conexion al webhook; permite Wi-Fi (nmtui) o continuar sin red.
@@ -11,16 +11,16 @@ Se ejecuta dentro de la ISO Debian Live. Flujo:
   5. Por disco: muestreo previo -> borrado por firmware (con cadena de respaldo) -> verificacion.
   6. Certificado PDF (WeasyPrint) + JSON de datos + huella SHA-256/HMAC -> USB -> Power Automate.
      Sin red, el envio queda en cola (Pendientes_Envio) y se reintenta en el siguiente arranque con red.
-
+ 
 Modos: borrado real, simulacion (no borra, PDF marcado) y diagnostico (solo reporta capacidades).
-
+ 
 Codigos de metodo (de mas a menos preferido):
   NVMe : nvme-sanitize-crypto > nvme-sanitize-block > nvme-format-crypto > nvme-format-user
   SATA : ata-sanitize-crypto > ata-sanitize-block > ata-secure-erase-enhanced > ata-secure-erase
   HDD  : ata-secure-erase > sobrescritura
   Otro : sobrescritura
 """
-
+ 
 import argparse
 import base64
 import configparser
@@ -44,15 +44,15 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-
-VERSION = "1.0.0"
+ 
+VERSION = "1.0.1"
 MEDIO_LIVE = "/run/live/medium"
 PUNTO_MONTAJE_EXTRA = "/mnt/alamo_usb"
 CARPETA_REPORTES = "Reportes_Borrado_Seguro"
 CARPETA_PENDIENTES = "Pendientes_Envio"
 NOMBRE_CONF = "alamo-wipe.conf"
 DIR_APP = os.path.dirname(os.path.abspath(__file__))
-
+ 
 CONF_DEFECTO = {
     "empresa": "Álamo Seguros",
     "webhook_url": "",
@@ -64,7 +64,7 @@ CONF_DEFECTO = {
     "sobrescribir_ssd_si_falla": "no",
     "clave_hmac": "",
 }
-
+ 
 NIVEL_METODO = {
     "nvme-sanitize-crypto": ("Purge", "Borrado criptográfico (NVMe Sanitize - Crypto Erase)"),
     "nvme-sanitize-block": ("Purge", "Borrado de bloques (NVMe Sanitize - Block Erase)"),
@@ -76,21 +76,21 @@ NIVEL_METODO = {
     "ata-secure-erase": ("Purge", "ATA Security Erase (firmware)"),
     "sobrescritura": ("Clear", "Sobrescritura de 1 pasada con ceros (shred)"),
 }
-
+ 
 GENERICOS_DMI = re.compile(
     r"^(to be filled.*|default string|system serial number|system product name|not specified|"
     r"none|o\.e\.m\.?|oem|0+|x+|n/a|chassis serial number)$", re.I)
-
-
+ 
+ 
 # =====================================================================================
 #  Utilidades
 # =====================================================================================
-
+ 
 class Bitacora:
     def __init__(self):
         self.lineas = []
         self.ruta = "/tmp/alamo_wipe_%s.log" % dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-
+ 
     def _w(self, nivel, msg, consola=True):
         linea = "%s [%s] %s" % (dt.datetime.now().strftime("%H:%M:%S"), nivel, msg)
         self.lineas.append(linea)
@@ -103,17 +103,17 @@ class Bitacora:
             colores = {"OK": "\033[32m", "ERR": "\033[31m", "AVISO": "\033[33m", "PASO": "\033[36m"}
             c = colores.get(nivel, "")
             print("%s[%s]\033[0m %s" % (c, nivel, msg) if c else "[%s] %s" % (nivel, msg), flush=True)
-
+ 
     def paso(self, m): self._w("PASO", m)
     def ok(self, m): self._w("OK", m)
     def err(self, m): self._w("ERR", m)
     def aviso(self, m): self._w("AVISO", m)
     def info(self, m, consola=True): self._w("INFO", m, consola)
-
-
+ 
+ 
 LOG = Bitacora()
-
-
+ 
+ 
 def run(cmd, timeout=120, entrada=None):
     """Ejecuta un comando (lista, sin shell). Devuelve (codigo, stdout, stderr). Nunca lanza."""
     try:
@@ -124,16 +124,16 @@ def run(cmd, timeout=120, entrada=None):
         return 127, "", "Comando no encontrado: %s" % cmd[0]
     except subprocess.TimeoutExpired:
         return 124, "", "Tiempo agotado (%ss): %s" % (timeout, " ".join(cmd))
-
-
+ 
+ 
 def cmd_txt(cmd):
     return " ".join(cmd)
-
-
+ 
+ 
 def es_verdadero(v):
     return v in (True, 1, "1", "true", "True")
-
-
+ 
+ 
 def tam_legible(b):
     try:
         b = float(b)
@@ -144,15 +144,15 @@ def tam_legible(b):
             return ("%.0f %s" if u in ("B", "KB") else "%.1f %s") % (b, u)
         b /= 1000.0
     return "N/D"
-
-
+ 
+ 
 def duracion(seg):
     seg = int(seg)
     h, r = divmod(seg, 3600)
     m, s = divmod(r, 60)
     return "%d h %02d min %02d s" % (h, m, s) if h else "%d min %02d s" % (m, s)
-
-
+ 
+ 
 def buscar_clave(obj, clave):
     """Busca recursivamente una clave en JSON anidado (la salida de nvme-cli cambia entre versiones)."""
     if isinstance(obj, dict):
@@ -168,43 +168,43 @@ def buscar_clave(obj, clave):
             if r is not None:
                 return r
     return None
-
-
+ 
+ 
 def leer(ruta, defecto=""):
     try:
         with open(ruta, "r", errors="replace") as f:
             return f.read().strip()
     except OSError:
         return defecto
-
-
+ 
+ 
 # =====================================================================================
 #  Interfaz (whiptail)
 # =====================================================================================
-
+ 
 class UI:
     TITULO = "Álamo Seguros - Borrado Seguro NIST 800-88"
-
+ 
     def __init__(self, interactiva=True):
         self.interactiva = interactiva and sys.stdin.isatty() and shutil.which("whiptail")
-
+ 
     def _wt(self, args):
         p = subprocess.run(["whiptail", "--backtitle", self.TITULO] + args, stderr=subprocess.PIPE, text=True)
         return p.returncode, p.stderr.strip()
-
+ 
     def mensaje(self, titulo, texto, alto=14, ancho=74):
         if not self.interactiva:
             print("\n== %s ==\n%s\n" % (titulo, texto))
             return
         self._wt(["--title", titulo, "--msgbox", texto, str(alto), str(ancho)])
-
+ 
     def si_no(self, titulo, texto, si="Sí", no="No", alto=14, ancho=74):
         if not self.interactiva:
             return True
         rc, _ = self._wt(["--title", titulo, "--yes-button", si, "--no-button", no,
                           "--yesno", texto, str(alto), str(ancho)])
         return rc == 0
-
+ 
     def menu(self, titulo, texto, opciones, alto=20, ancho=78):
         if not self.interactiva:
             return None
@@ -213,7 +213,7 @@ class UI:
             args += [clave, desc]
         rc, sal = self._wt(args)
         return sal if rc == 0 else None
-
+ 
     def lista(self, titulo, texto, opciones, alto=20, ancho=78):
         """opciones: [(clave, descripcion, marcado)]. Devuelve lista de claves o None."""
         if not self.interactiva:
@@ -226,35 +226,35 @@ class UI:
         if rc != 0:
             return None
         return [l.strip().strip('"') for l in sal.splitlines() if l.strip()]
-
+ 
     def entrada(self, titulo, texto, alto=14, ancho=74):
         if not self.interactiva:
             return None
         rc, sal = self._wt(["--title", titulo, "--inputbox", texto, str(alto), str(ancho)])
         return sal if rc == 0 else None
-
+ 
     def archivo(self, titulo, ruta):
         if self.interactiva:
             self._wt(["--title", titulo, "--scrolltext", "--textbox", ruta, "24", "90"])
-
+ 
     def pausa(self, texto="Presione Enter para continuar..."):
         if self.interactiva:
             try:
                 input("\n" + texto)
             except EOFError:
                 pass
-
-
+ 
+ 
 # =====================================================================================
 #  USB de reportes y configuracion
 # =====================================================================================
-
+ 
 def disco_padre(dispositivo):
     rc, out, _ = run(["lsblk", "-n", "-o", "PKNAME", dispositivo])
     padre = out.strip().splitlines()[0].strip() if rc == 0 and out.strip() else ""
     return "/dev/" + padre if padre else ""
-
-
+ 
+ 
 def disco_arranque():
     """Disco fisico que contiene el sistema live (nunca debe ofrecerse para borrado)."""
     rc, out, _ = run(["findmnt", "-n", "-o", "SOURCE", MEDIO_LIVE])
@@ -262,8 +262,8 @@ def disco_arranque():
         return ""
     fuente = out.strip().splitlines()[0]
     return disco_padre(fuente) or fuente
-
-
+ 
+ 
 def probar_escritura(directorio):
     try:
         os.makedirs(directorio, exist_ok=True)
@@ -274,8 +274,8 @@ def probar_escritura(directorio):
         return True
     except OSError:
         return False
-
-
+ 
+ 
 def preparar_destino():
     """Devuelve (raiz_usb, es_usb). La raiz contiene alamo-wipe.conf y la carpeta de reportes."""
     # 1) El propio medio live (Rufus en modo ISO = FAT32 escribible).
@@ -310,10 +310,11 @@ def preparar_destino():
     local = "/root/alamo"
     os.makedirs(os.path.join(local, CARPETA_REPORTES), exist_ok=True)
     return local, False
-
-
+ 
+ 
 def leer_conf(raiz):
-    cp = configparser.ConfigParser()
+    # interpolation=None: las URL de Power Automate llevan '%2F', que ConfigParser trataria como variable.
+    cp = configparser.ConfigParser(interpolation=None)
     cp.read_dict({"general": CONF_DEFECTO})
     for ruta in (os.path.join(DIR_APP, NOMBRE_CONF), os.path.join(raiz, NOMBRE_CONF)):
         if os.path.isfile(ruta):
@@ -323,22 +324,22 @@ def leer_conf(raiz):
             except configparser.Error as e:
                 LOG.aviso("No se pudo leer %s: %s" % (ruta, e))
     return dict(cp["general"])
-
-
+ 
+ 
 def sincronizar_usb():
     run(["sync"], timeout=60)
-
-
+ 
+ 
 # =====================================================================================
 #  Datos del equipo
 # =====================================================================================
-
+ 
 def dmi(clave):
     rc, out, _ = run(["dmidecode", "-s", clave])
     v = out.strip().splitlines()[-1].strip() if rc == 0 and out.strip() else ""
     return "" if (not v or GENERICOS_DMI.match(v)) else v
-
-
+ 
+ 
 def estado_secure_boot():
     base = "/sys/firmware/efi"
     if not os.path.isdir(base):
@@ -350,8 +351,8 @@ def estado_secure_boot():
         return "Activo" if datos and datos[-1] == 1 else "Inactivo"
     except OSError:
         return "Desconocido"
-
-
+ 
+ 
 def info_equipo():
     cpu = ""
     for l in leer("/proc/cpuinfo").splitlines():
@@ -378,8 +379,8 @@ def info_equipo():
         "folio": str(uuid.uuid4()).upper(),
         "ntp": "N/D",
     }
-
-
+ 
+ 
 def controlador_raid():
     """Detecta controladoras en modo RAID/VMD (Intel RST) que pueden ocultar discos."""
     rc, out, _ = run(["lspci", "-nn"])
@@ -388,17 +389,17 @@ def controlador_raid():
         if "RAID bus controller" in l or "Volume Management Device" in l or "VMD" in l:
             hallazgos.append(l.strip())
     return hallazgos
-
-
+ 
+ 
 def hora_sincronizada():
     rc, out, _ = run(["timedatectl", "show", "-p", "NTPSynchronized", "--value"])
     return out.strip() == "yes"
-
-
+ 
+ 
 # =====================================================================================
 #  Deteccion de discos y capacidades
 # =====================================================================================
-
+ 
 def discos_con_montajes():
     usados = set()
     for l in leer("/proc/mounts").splitlines():
@@ -406,8 +407,8 @@ def discos_con_montajes():
         if fuente.startswith("/dev/"):
             usados.add(disco_padre(fuente) or fuente)
     return usados
-
-
+ 
+ 
 def listar_discos(conf):
     excluir = {disco_arranque()} | discos_con_montajes()
     excluir.discard("")
@@ -446,8 +447,8 @@ def listar_discos(conf):
     for d in discos:
         analizar_disco(d, conf)
     return discos, excluidos
-
-
+ 
+ 
 def info_smart(d):
     rc, out, _ = run(["smartctl", "-j", "-i", "-H", "-A", d["ruta"]], timeout=60)
     try:
@@ -461,8 +462,8 @@ def info_smart(d):
     d["salud"] = "Correcta (PASSED)" if estado is True else ("FALLA (FAILED)" if estado is False else "N/D")
     horas = (j.get("power_on_time") or {}).get("hours")
     d["horas"] = str(horas) if horas is not None else "N/D"
-
-
+ 
+ 
 def analizar_disco(d, conf):
     d.setdefault("firmware", "")
     d.update({"salud": "N/D", "horas": "N/D", "capacidades": [], "notas": [], "metodos": []})
@@ -482,8 +483,8 @@ def analizar_disco(d, conf):
         d["metodos"].append("sobrescritura")
     d["es_ssd"] = ssd
     d["propuesto"] = d["metodos"][0] if d["metodos"] else ""
-
-
+ 
+ 
 def analizar_nvme(d):
     ctrl = os.path.basename(os.path.realpath("/sys/block/%s/device" % d["nombre"]))
     d["ctrl"] = "/dev/" + ctrl if ctrl.startswith("nvme") else re.sub(r"n\d+$", "", d["ruta"])
@@ -514,8 +515,8 @@ def analizar_nvme(d):
     nn = int(j.get("nn") or 1)
     if nn > 1:
         d["notas"].append("El controlador admite %d namespaces; Sanitize afecta a todos." % nn)
-
-
+ 
+ 
 def analizar_ata(d):
     rc, out, err = run(["hdparm", "-I", d["ruta"]])
     d["ata"] = {}
@@ -565,20 +566,20 @@ def analizar_ata(d):
         d["notas"].append("Seguridad ATA en estado FROZEN (se intentará suspender/reanudar).")
     if a["bloqueado"]:
         d["notas"].append("El disco está BLOQUEADO con contraseña ATA.")
-
-
+ 
+ 
 # =====================================================================================
 #  Verificacion por muestreo (antes / despues)
 # =====================================================================================
-
+ 
 TAM_MUESTRA = 64 * 1024
-
-
+ 
+ 
 def tam_dispositivo(ruta):
     rc, out, _ = run(["blockdev", "--getsize64", ruta])
     return int(out.strip()) if rc == 0 and out.strip().isdigit() else 0
-
-
+ 
+ 
 def posiciones(tam, n, semilla):
     rnd = random.Random(semilla)
     bloques = max(1, tam // TAM_MUESTRA)
@@ -586,8 +587,8 @@ def posiciones(tam, n, semilla):
     while len(pos) < min(n, bloques):
         pos.add(rnd.randrange(bloques) * TAM_MUESTRA)
     return sorted(pos)
-
-
+ 
+ 
 def vaciar_cache(ruta):
     run(["blockdev", "--flushbufs", ruta])
     try:
@@ -595,8 +596,8 @@ def vaciar_cache(ruta):
             f.write("3\n")
     except OSError:
         pass
-
-
+ 
+ 
 def leer_muestras(ruta, offsets):
     """Lee con O_DIRECT (evita que la cache del kernel devuelva datos previos al borrado)."""
     vaciar_cache(ruta)
@@ -634,8 +635,8 @@ def leer_muestras(ruta, offsets):
         buf.close()
         os.close(fd)
     return resultado
-
-
+ 
+ 
 def clasificar(datos):
     if not datos:
         return "vacio"
@@ -643,8 +644,8 @@ def clasificar(datos):
     if datos.count(primero) == len(datos):
         return {0x00: "ceros", 0xFF: "unos"}.get(primero, "uniforme")
     return "datos"
-
-
+ 
+ 
 def evaluar_verificacion(antes, despues, exige_ceros=False):
     previas = {m["offset"]: m for m in antes}
     con_datos = [m for m in antes if m["clase"] == "datos"]
@@ -674,17 +675,17 @@ def evaluar_verificacion(antes, despues, exige_ceros=False):
         r["texto"] = "%d de %d muestras con datos previos cambiaron tras el borrado; ninguna conserva su contenido." % (
             len(con_datos), len(con_datos))
     return r
-
-
+ 
+ 
 # =====================================================================================
 #  Metodos de borrado
 # =====================================================================================
-
+ 
 def progreso(texto):
     sys.stdout.write("\r    %s\033[K" % texto)
     sys.stdout.flush()
-
-
+ 
+ 
 def estado_sanitize_nvme(ctrl):
     rc, out, _ = run(["nvme", "sanitize-log", ctrl, "-o", "json"])
     try:
@@ -696,8 +697,8 @@ def estado_sanitize_nvme(ctrl):
         return int(sstat), int(sprog or 0)
     except (TypeError, ValueError):
         return None, None
-
-
+ 
+ 
 def m_nvme_sanitize(d, sanact):
     cmd = ["nvme", "sanitize", d["ctrl"], "--sanact=%d" % sanact]
     rc, out, err = run(cmd, timeout=180)
@@ -728,8 +729,8 @@ def m_nvme_sanitize(d, sanact):
                 return False, "El controlador no inició el Sanitize (SSTAT=0).", cmd
         time.sleep(2)
     return False, "Tiempo máximo de espera agotado para Sanitize.", cmd
-
-
+ 
+ 
 def m_nvme_format(d, ses):
     cmd = ["nvme", "format", d["ruta"], "--namespace-id=%s" % d["nsid"], "--ses=%d" % ses, "--force"]
     rc, out, err = run(cmd, timeout=4 * 3600)
@@ -737,8 +738,8 @@ def m_nvme_format(d, ses):
         return False, "nvme format falló (rc=%d): %s" % (rc, (err or out).strip()[:300]), cmd
     run(["blockdev", "--rereadpt", d["ruta"]])
     return True, "Format NVM completado: %s" % out.strip()[:200], cmd
-
-
+ 
+ 
 def m_ata_sanitize(d, tipo):
     opcion = "--sanitize-crypto-scramble" if tipo == "crypto" else "--sanitize-block-erase"
     cmd = ["hdparm", "--yes-i-know-what-i-am-doing", opcion, d["ruta"]]
@@ -759,8 +760,8 @@ def m_ata_sanitize(d, tipo):
             return False, "El disco reportó fallo de Sanitize: %s" % " ".join(out.split())[:200], cmd
         time.sleep(3)
     return False, "Tiempo máximo de espera agotado para ATA Sanitize.", cmd
-
-
+ 
+ 
 def descongelar_ata(d):
     modos = leer("/sys/power/mem_sleep")
     LOG.aviso("Disco FROZEN: suspendiendo 8 s para que el disco se reinicie (modos: %s)." % (modos or "N/D"))
@@ -770,8 +771,8 @@ def descongelar_ata(d):
     time.sleep(6)
     analizar_ata(d)
     return not d.get("ata", {}).get("congelado", True)
-
-
+ 
+ 
 def m_ata_security(d, enhanced):
     analizar_ata(d)
     a = d.get("ata", {})
@@ -807,8 +808,8 @@ def m_ata_security(d, enhanced):
         return False, "Security Erase falló (rc=%d): %s" % (rc, (err or out).strip()[:300]), cmd
     run(["blockdev", "--rereadpt", d["ruta"]])
     return True, "Security Erase completado en %s; contraseña temporal retirada." % duracion(time.time() - inicio), cmd
-
-
+ 
+ 
 def m_sobrescritura(d):
     cmd = ["shred", "-v", "-n", "0", "-z", d["ruta"]]
     LOG.info("Sobrescritura en curso (puede tardar horas en discos grandes)...")
@@ -821,8 +822,8 @@ def m_sobrescritura(d):
     if rc != 0:
         return False, "shred terminó con código %d." % rc, cmd
     return True, "Sobrescritura completa con ceros (1 pasada).", cmd
-
-
+ 
+ 
 def ejecutar_metodo(d, metodo):
     if metodo == "nvme-sanitize-crypto":
         return m_nvme_sanitize(d, 4)
@@ -843,8 +844,8 @@ def ejecutar_metodo(d, metodo):
     if metodo == "sobrescritura":
         return m_sobrescritura(d)
     return False, "Método desconocido: %s" % metodo, []
-
-
+ 
+ 
 def borrar_disco(d, conf, simulacion):
     """Ejecuta la cadena de metodos con verificacion previa/posterior. Devuelve el registro para el certificado."""
     r = {k: d.get(k, "") for k in ("ruta", "clase", "modelo", "serie", "firmware", "tam", "salud", "horas")}
@@ -858,14 +859,14 @@ def borrar_disco(d, conf, simulacion):
         r["notas"].append("No hay método de borrado disponible para este disco (¿controladora en RAID/VMD?).")
         LOG.err(r["notas"][-1])
         return r
-
+ 
     tam = tam_dispositivo(d["ruta"]) or d["tam"]
     n = int(conf.get("muestras_verificacion", "32") or 32)
     offs = posiciones(tam, n, secrets.randbits(64))
     LOG.info("Muestreo previo: %d muestras de 64 KiB..." % len(offs))
     antes = leer_muestras(d["ruta"], offs)
     LOG.info("Muestras con datos antes del borrado: %d/%d" % (sum(1 for m in antes if m["clase"] == "datos"), len(antes)))
-
+ 
     if simulacion:
         metodo = d["metodos"][0]
         nivel, desc = NIVEL_METODO[metodo]
@@ -891,7 +892,7 @@ def borrar_disco(d, conf, simulacion):
                 LOG.aviso("Se intentará el siguiente método disponible.")
         finally:
             signal.signal(signal.SIGINT, senal_previa)
-
+ 
         if not exito:
             r.update({"estado": "Fallido", "verificacion": {"estado": "N/A", "texto": "Ningún método se completó."}})
         else:
@@ -913,12 +914,12 @@ def borrar_disco(d, conf, simulacion):
     r["duracion"] = duracion(time.time() - t0)
     r["muestras"] = len(offs)
     return r
-
-
+ 
+ 
 # =====================================================================================
 #  Certificado
 # =====================================================================================
-
+ 
 PLANTILLA = r"""<!DOCTYPE html>
 <html lang="es"><head><meta charset="utf-8"><title>Certificado de Borrado Seguro - {{SERIE}}</title>
 <style>
@@ -967,7 +968,7 @@ table { width: 100%; border-collapse: collapse; }
 <p class="lead">Se hace constar que los medios de almacenamiento del equipo descrito fueron sanitizados desde un
 entorno de arranque independiente del sistema operativo, conforme a la guía NIST SP 800-88 Rev. 1
 (Guidelines for Media Sanitization). Resultado global: {{ESTADO_GLOBAL}}</p>
-
+ 
 <h2>Datos del equipo</h2>
 <table class="datos">
 <tr><td class="k">Fabricante</td><td>{{FABRICANTE}}</td><td class="k">Modelo</td><td>{{MODELO}}</td></tr>
@@ -976,7 +977,7 @@ entorno de arranque independiente del sistema operativo, conforme a la guía NIS
 <tr><td class="k">BIOS</td><td>{{BIOS}}</td><td class="k">Secure Boot</td><td>{{SECURE_BOOT}}</td></tr>
 <tr><td class="k">Inicio</td><td>{{FECHA}}</td><td class="k">Fin</td><td>{{FECHA_FIN}} <span class="nota">(hora NTP: {{NTP}})</span></td></tr>
 </table>
-
+ 
 <h2>Resumen</h2>
 <div class="kpis">
 <div class="kpi"><div class="v">{{N_TOTAL}}</div><div class="l">Discos procesados</div></div>
@@ -984,11 +985,11 @@ entorno de arranque independiente del sistema operativo, conforme a la guía NIS
 <div class="kpi"><div class="v" style="color:#9A4A00">{{N_PARCIAL}}</div><div class="l">Parciales</div></div>
 <div class="kpi"><div class="v" style="color:#B3261E">{{N_FALLA}}</div><div class="l">Con falla</div></div>
 </div>
-
+ 
 <h2>Detalle por medio de almacenamiento</h2>
 {{DISCOS}}
 {{EXCLUIDOS}}
-
+ 
 <h2>Metodología</h2>
 <div class="metodologia">
 Cada disco se identifica por modelo y número de serie (SMART). Se aplica el método de sanitización por firmware más
@@ -999,7 +1000,7 @@ inicio, la mitad y el final del disco) y se calcula su hash SHA-256; después de
 y se confirma que ninguna muestra con datos conserva su contenido. La huella de integridad del pie se calcula sobre
 los datos completos de este certificado (archivo JSON adjunto) y se registra en SharePoint al momento del envío.
 </div>
-
+ 
 <div class="cierre">
 <div class="firmas"><div class="firma">Nombre y firma del responsable del borrado</div>
 <div class="firma">Nombre y firma de Vo. Bo. TI</div></div>
@@ -1009,18 +1010,18 @@ alamo_wipe.py v{{VERSION}} &middot; Debian Live &middot; {{SERIE}}</div>
 </div>
 </body></html>
 """
-
-
+ 
+ 
 def esc(v):
     return html.escape("" if v is None else str(v))
-
-
+ 
+ 
 def badge(estado):
     clase = {"Exitoso": "ok", "Aprobada": "ok", "Correcto": "ok", "Fallido": "err", "Fallida": "err",
              "Falló": "err", "Parcial": "warn", "No concluyente": "warn", "Simulación": "sim"}.get(estado, "neutral")
     return '<span class="badge %s">%s</span>' % (clase, esc(estado))
-
-
+ 
+ 
 def html_disco(i, r):
     v = r.get("verificacion", {})
     intentos = "".join("<tr><td>%s</td><td>%s</td><td>%s</td></tr>" % (esc(t["metodo"]), badge(t["resultado"]),
@@ -1048,8 +1049,8 @@ def html_disco(i, r):
         esc(r["metodo"] or "Ninguno"), esc(r["nivel"] or "N/A"), esc(r["inicio"]), esc(r.get("fin", "")),
         esc(r.get("duracion", "")), badge(v.get("estado", "N/A")), verif, esc(r.get("comando") or "N/A"),
         intentos or '<tr><td colspan="3">Sin intentos.</td></tr>', notas)
-
-
+ 
+ 
 def html_excluidos(excluidos):
     if not excluidos:
         return ""
@@ -1057,8 +1058,8 @@ def html_excluidos(excluidos):
         esc(e["ruta"]), esc(e["modelo"] or "N/D"), esc(e["serie"] or "N/D"), esc(e["motivo"])) for e in excluidos)
     return ('<h2>Dispositivos no procesados</h2><table class="lista"><thead><tr><th>Dispositivo</th><th>Modelo</th>'
             '<th>Serie</th><th>Motivo</th></tr></thead><tbody>%s</tbody></table>' % filas)
-
-
+ 
+ 
 def logo_html(raiz, empresa):
     for ruta in (os.path.join(raiz, "logo.png"), os.path.join(DIR_APP, "logo.png")):
         if os.path.isfile(ruta):
@@ -1066,8 +1067,8 @@ def logo_html(raiz, empresa):
                 return '<img class="logo-img" src="data:image/png;base64,%s" alt="%s">' % (
                     base64.b64encode(f.read()).decode(), esc(empresa))
     return '<span class="marca-texto">%s</span>' % esc(empresa)
-
-
+ 
+ 
 def estado_global(resultados, simulacion):
     if simulacion:
         return "Simulación"
@@ -1079,15 +1080,15 @@ def estado_global(resultados, simulacion):
     if "Fallido" in estados:
         return "Fallido"
     return "Parcial"
-
-
+ 
+ 
 def huella(datos, clave_hmac):
     canon = json.dumps(datos, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     if clave_hmac:
         return "HMAC-SHA256", hmac.new(clave_hmac.encode("utf-8"), canon, hashlib.sha256).hexdigest()
     return "SHA-256", hashlib.sha256(canon).hexdigest()
-
-
+ 
+ 
 def generar_certificado(raiz, conf, equipo, resultados, excluidos, simulacion):
     global_ = estado_global(resultados, simulacion)
     equipo["fecha_fin"] = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1096,7 +1097,7 @@ def generar_certificado(raiz, conf, equipo, resultados, excluidos, simulacion):
              "excluidos": [{k: e[k] for k in ("ruta", "modelo", "serie", "motivo")} for e in excluidos]}
     etiqueta, valor = huella(datos, conf.get("clave_hmac", ""))
     datos["huella"] = {"algoritmo": etiqueta, "valor": valor}
-
+ 
     sku = " / ".join(x for x in (equipo.get("sku"), equipo.get("activo")) if x) or "N/D"
     valores = {
         "{{LOGO}}": logo_html(raiz, conf["empresa"]),
@@ -1123,7 +1124,7 @@ def generar_certificado(raiz, conf, equipo, resultados, excluidos, simulacion):
     doc = PLANTILLA
     for k, v in valores.items():
         doc = doc.replace(k, v)
-
+ 
     serie_arch = re.sub(r"[^A-Za-z0-9_-]", "", equipo["serie"]) or "SINSERIE"
     base = "Certificado_BorradoSeguro_%s_%s%s" % (serie_arch, equipo["fecha_archivo"], "_SIMULACION" if simulacion else "")
     carpeta = os.path.join(raiz, CARPETA_REPORTES)
@@ -1142,17 +1143,17 @@ def generar_certificado(raiz, conf, equipo, resultados, excluidos, simulacion):
             f.write(doc)
     sincronizar_usb()
     return ruta_pdf, ruta_json, datos, global_
-
-
+ 
+ 
 # =====================================================================================
 #  Red y Power Automate
 # =====================================================================================
-
+ 
 def host_webhook(conf):
     url = conf.get("webhook_url", "").strip()
     return urllib.parse.urlparse(url).hostname if url else ""
-
-
+ 
+ 
 def hay_red(conf):
     url = urllib.parse.urlparse(conf.get("webhook_url", "").strip())
     host = url.hostname or "login.microsoftonline.com"
@@ -1162,8 +1163,8 @@ def hay_red(conf):
         return True
     except OSError:
         return False
-
-
+ 
+ 
 def esperar_red(conf, segundos):
     limite = time.time() + segundos
     while time.time() < limite:
@@ -1171,8 +1172,8 @@ def esperar_red(conf, segundos):
             return True
         time.sleep(2)
     return False
-
-
+ 
+ 
 def enviar_webhook(conf, payload):
     url = conf.get("webhook_url", "").strip()
     if not url:
@@ -1197,8 +1198,8 @@ def enviar_webhook(conf, payload):
         if i < intentos:
             time.sleep(5 * i)
     return False, ultimo
-
-
+ 
+ 
 def armar_payload(conf, datos, ruta_pdf):
     with open(ruta_pdf, "rb") as f:
         contenido = f.read()
@@ -1220,8 +1221,8 @@ def armar_payload(conf, datos, ruta_pdf):
         "huella": datos["huella"]["valor"],
         "hashPdf": hashlib.sha256(contenido).hexdigest(),
     }
-
-
+ 
+ 
 def encolar(raiz, payload):
     carpeta = os.path.join(raiz, CARPETA_PENDIENTES)
     os.makedirs(carpeta, exist_ok=True)
@@ -1230,8 +1231,8 @@ def encolar(raiz, payload):
         json.dump(payload, f, ensure_ascii=False)
     sincronizar_usb()
     return ruta
-
-
+ 
+ 
 def enviar_pendientes(raiz, conf):
     carpeta = os.path.join(raiz, CARPETA_PENDIENTES)
     if not os.path.isdir(carpeta) or not conf.get("webhook_url", "").strip():
@@ -1257,17 +1258,17 @@ def enviar_pendientes(raiz, conf):
             LOG.aviso("Pendiente no enviado (%s): %s" % (det, nombre))
     sincronizar_usb()
     return enviados, fallidos
-
-
+ 
+ 
 def contar_pendientes(raiz):
     carpeta = os.path.join(raiz, CARPETA_PENDIENTES)
     return len([n for n in os.listdir(carpeta) if n.endswith(".json")]) if os.path.isdir(carpeta) else 0
-
-
+ 
+ 
 # =====================================================================================
 #  Energia
 # =====================================================================================
-
+ 
 def en_corriente():
     base = "/sys/class/power_supply"
     if not os.path.isdir(base):
@@ -1280,18 +1281,18 @@ def en_corriente():
         elif tipo in ("Mains", "USB") and leer(os.path.join(base, n, "online")) == "1":
             return True
     return not hay_bateria
-
-
+ 
+ 
 # =====================================================================================
 #  Pantallas
 # =====================================================================================
-
+ 
 def describir(d):
     metodo = NIVEL_METODO[d["propuesto"]][1] if d.get("propuesto") else "SIN MÉTODO DISPONIBLE"
     return "%s | %s | S/N %s | %s -> %s" % (d["clase"], (d["modelo"] or "?")[:22], (d["serie"] or "?")[:16],
                                             tam_legible(d["tam"]), metodo)
-
-
+ 
+ 
 def pantalla_red(ui, raiz, conf):
     if not conf.get("webhook_url", "").strip():
         ui.mensaje("Red", "No hay webhook_url en alamo-wipe.conf.\n\nLos certificados se guardarán solo en la USB.", 10)
@@ -1315,8 +1316,8 @@ def pantalla_red(ui, raiz, conf):
                 return True
         else:
             return False
-
-
+ 
+ 
 def pantalla_corriente(ui, conf):
     if conf.get("requerir_corriente", "si").lower() not in ("si", "sí", "yes"):
         return True
@@ -1326,8 +1327,8 @@ def pantalla_corriente(ui, conf):
                         si="Reintentar", no="Cancelar", alto=12):
             return False
     return True
-
-
+ 
+ 
 def diagnostico(ui, raiz, conf, equipo):
     discos, excluidos = listar_discos(conf)
     lineas = ["DIAGNÓSTICO DE HARDWARE - %s" % dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1363,8 +1364,8 @@ def diagnostico(ui, raiz, conf, equipo):
     if not ui.interactiva:
         print("\n".join(lineas))
     return ruta
-
-
+ 
+ 
 def flujo_borrado(ui, raiz, es_usb, conf, equipo, simulacion, discos_cli=None, confirmar_cli=False):
     discos, excluidos = listar_discos(conf)
     if not discos:
@@ -1386,7 +1387,7 @@ def flujo_borrado(ui, raiz, es_usb, conf, equipo, simulacion, discos_cli=None, c
         ui.mensaje("Sin selección", "No se seleccionó ningún disco.")
         return
     no_seleccionados = [dict(d, motivo="No seleccionado por el operador") for d in discos if d not in seleccion]
-
+ 
     resumen = "\n".join("  %s  %s  S/N %s  (%s)" % (d["ruta"], d["modelo"], d["serie"], tam_legible(d["tam"]))
                         for d in seleccion)
     if not simulacion:
@@ -1400,7 +1401,7 @@ def flujo_borrado(ui, raiz, es_usb, conf, equipo, simulacion, discos_cli=None, c
             if texto != "BORRAR":
                 ui.mensaje("Cancelado", "Confirmación incorrecta. No se modificó ningún disco.", 8)
                 return
-
+ 
     os.system("clear")
     print("=" * 78)
     print("  %s - %s" % ("SIMULACIÓN (no se borra nada)" if simulacion else "BORRADO SEGURO NIST SP 800-88",
@@ -1408,14 +1409,14 @@ def flujo_borrado(ui, raiz, es_usb, conf, equipo, simulacion, discos_cli=None, c
     print("=" * 78)
     run(["dmesg", "-n", "1"])
     resultados = [borrar_disco(d, conf, simulacion) for d in seleccion]
-
+ 
     red = hay_red(conf)
     equipo["ntp"] = "sí" if hora_sincronizada() else "no"
     LOG.paso("Generando certificado...")
     ruta_pdf, ruta_json, datos, global_ = generar_certificado(raiz, conf, equipo, resultados,
                                                               excluidos + no_seleccionados, simulacion)
     LOG.ok("Certificado: %s" % ruta_pdf)
-
+ 
     envio = "No aplica (simulación)"
     if not simulacion and ruta_pdf.endswith(".pdf"):
         payload = armar_payload(conf, datos, ruta_pdf)
@@ -1432,14 +1433,14 @@ def flujo_borrado(ui, raiz, es_usb, conf, equipo, simulacion, discos_cli=None, c
             encolar(raiz, payload)
             envio = "Sin red: quedó pendiente en la USB (se envía en el próximo arranque con red)"
         (LOG.ok if envio.startswith("Enviado") else LOG.aviso)(envio)
-
+ 
     serie = re.sub(r"[^A-Za-z0-9_-]", "", equipo["serie"]) or "SINSERIE"
     try:
         shutil.copy(LOG.ruta, os.path.join(raiz, CARPETA_REPORTES, "Log_%s_%s.txt" % (serie, equipo["fecha_archivo"])))
         sincronizar_usb()
     except OSError:
         pass
-
+ 
     lineas = ["%s  %s  ->  %s" % (r["ruta"], r["modelo"] or "?", r["estado"]) for r in resultados]
     ui.pausa("Proceso terminado. Presione Enter para ver el resumen...")
     ui.mensaje("Resultado: %s" % global_,
@@ -1449,8 +1450,8 @@ def flujo_borrado(ui, raiz, es_usb, conf, equipo, simulacion, discos_cli=None, c
     # Nueva transaccion para el siguiente proceso en el mismo arranque.
     equipo.update({k: v for k, v in info_equipo().items() if k in ("folio", "fecha_inicio", "fecha_archivo")})
     return global_
-
-
+ 
+ 
 def menu_principal(ui, raiz, es_usb, conf):
     equipo = info_equipo()
     run(["setterm", "--blank", "0", "--powerdown", "0"])
@@ -1499,8 +1500,8 @@ def menu_principal(ui, raiz, es_usb, conf):
             sincronizar_usb()
             subprocess.run(["systemctl", "reboot"])
             return
-
-
+ 
+ 
 def main():
     ap = argparse.ArgumentParser(description="Álamo Seguros - borrado seguro NIST 800-88")
     ap.add_argument("--simulacion", action="store_true", help="no borra; certificado marcado")
@@ -1509,7 +1510,7 @@ def main():
     ap.add_argument("--confirmar", default="", help="escriba BORRAR para borrado no interactivo")
     ap.add_argument("--destino", help="carpeta raíz para reportes (pruebas)")
     args = ap.parse_args()
-
+ 
     if os.geteuid() != 0:
         print("Debe ejecutarse como root.")
         return 1
@@ -1520,7 +1521,7 @@ def main():
         raiz, es_usb = preparar_destino()
     conf = leer_conf(raiz)
     LOG.info("alamo_wipe v%s | destino: %s" % (VERSION, raiz), consola=False)
-
+ 
     no_interactivo = bool(args.disco or args.diagnostico)
     ui = UI(interactiva=not no_interactivo)
     equipo = info_equipo()
@@ -1536,7 +1537,38 @@ def main():
         return 0 if r in ("Exitoso", "Simulación") else 3
     menu_principal(ui, raiz, es_usb, conf)
     return 0
-
-
+ 
+ 
+def main_protegido():
+    """Si algo falla, muestra el error y espera (evita el reinicio en bucle del servicio) y lo guarda en la USB."""
+    try:
+        return main()
+    except KeyboardInterrupt:
+        return 130
+    except Exception:   # noqa: BLE001
+        import traceback
+        detalle = traceback.format_exc()
+        LOG.err("Error inesperado:\n" + detalle)
+        for raiz in (MEDIO_LIVE, "/root"):
+            try:
+                if raiz == MEDIO_LIVE:
+                    run(["mount", "-o", "remount,rw", MEDIO_LIVE])
+                ruta = os.path.join(raiz, "Error_alamo_wipe_%s.txt" % dt.datetime.now().strftime("%Y%m%d_%H%M%S"))
+                with open(ruta, "w", encoding="utf-8") as f:
+                    f.write("alamo_wipe v%s\n\n%s\n\n%s\n" % (VERSION, detalle, "\n".join(LOG.lineas)))
+                run(["sync"])
+                print("\nEl detalle se guardó en: %s" % ruta)
+                break
+            except OSError:
+                continue
+        print("\nOcurrió un error. Tome una foto de esta pantalla y envíela a TI.")
+        try:
+            input("Presione Enter para reiniciar la aplicación...")
+        except EOFError:
+            time.sleep(60)
+        return 1
+ 
+ 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main_protegido())
+ 
