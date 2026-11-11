@@ -47,7 +47,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 MEDIO_LIVE = "/run/live/medium"
 PUNTO_MONTAJE_EXTRA = "/mnt/alamo_usb"
 CARPETA_REPORTES = "Reportes_Borrado_Seguro"
@@ -1081,6 +1081,39 @@ def prueba_rapida(d):
     return r
 
 
+def _archivo_uniforme(ruta):
+    """True si el archivo esta vacio o todos sus bytes son iguales (no contiene informacion)."""
+    try:
+        with open(ruta, "rb") as f:
+            primero = None
+            while True:
+                bloque = f.read(1024 * 1024)
+                if not bloque:
+                    return True
+                if primero is None:
+                    primero = bloque[0]
+                if bloque.count(primero) != len(bloque):
+                    return False
+    except OSError:
+        return False
+
+
+def _descartar_vacios(destino, vistos):
+    """Elimina de inmediato lo 'recuperado' que solo contiene un byte repetido. Devuelve cuantos quito."""
+    n = 0
+    for f in glob.glob(destino + ".*/*"):
+        if f in vistos or f.endswith("report.xml") or not os.path.isfile(f):
+            continue
+        vistos.add(f)
+        if _archivo_uniforme(f):
+            try:
+                os.remove(f)
+                n += 1
+            except OSError:
+                pass
+    return n
+
+
 def prueba_photorec(d):
     """PhotoRec sobre todo el disco. Lo recuperado va a RAM (/tmp), nunca a la USB, y se borra al terminar."""
     t0 = time.time()
@@ -1089,17 +1122,21 @@ def prueba_photorec(d):
         r.update({"estado": "No disponible", "duracion": "0 s", "herramienta": "PhotoRec (no instalado)"})
         return r
     m = re.search(r"Version:\s*(\S+)", run(["photorec", "/version"])[1])
-    r["herramienta"] = "PhotoRec %s (TestDisk) - todas las firmas, disco completo" % (m.group(1) if m else "")
+    r["herramienta"] = "PhotoRec %s (TestDisk) - firmas predeterminadas, disco completo" % (m.group(1) if m else "")
     tmp = tempfile.mkdtemp(prefix="photorec_", dir="/tmp")
     destino, log = os.path.join(tmp, "rec"), os.path.join(tmp, "photorec.log")
     cmd = ["photorec", "/log", "/logname", log, "/d", destino, "/cmd", d["ruta"],
-           "partition_none,options,paranoid,keep_corrupted_file_no,fileopt,everything,enable,search"]
+           # Firmas predeterminadas de PhotoRec. Las que vienen desactivadas de fabrica (p. ej. 'dovecot',
+           # que se detecta con 48 bytes en cero) dan falsos positivos en un disco recien borrado.
+           "partition_none,options,paranoid,keep_corrupted_file_no,fileopt,dovecot,disable,search"]
     detenido = ""
+    vistos, descartados = set(), 0
     try:
         vaciar_cache(d["ruta"])
         with open(os.path.join(tmp, "salida.txt"), "w") as salida:
             p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=salida, stderr=subprocess.STDOUT)
             while p.poll() is None:
+                descartados += _descartar_vacios(destino, vistos)
                 archivos = [f for f in glob.glob(destino + ".*/*") if not f.endswith("report.xml")]
                 tam = sum(os.path.getsize(f) for f in archivos if os.path.isfile(f))
                 progreso("PhotoRec en curso: %s  |  archivos recuperados: %d  |  %s" % (
@@ -1114,6 +1151,7 @@ def prueba_photorec(d):
                     break
                 time.sleep(3)
         print()
+        descartados += _descartar_vacios(destino, vistos)
         archivos = [f for f in glob.glob(destino + ".*/*") if not f.endswith("report.xml") and os.path.isfile(f)]
         por_tipo = {}
         for f in archivos:
@@ -1122,6 +1160,7 @@ def prueba_photorec(d):
         resumen_log = re.findall(r"^(\S+): (\d+)/(\d+) recovered", leer(log), re.M)
         r["archivos"] = len(archivos)
         r["por_tipo"] = por_tipo
+        r["descartados_vacios"] = descartados
         r["comprobaciones"].append({
             "nombre": "Archivos recuperados por PhotoRec",
             "resultado": ("%d (%s)" % (len(archivos), ", ".join("%s: %d" % kv for kv in sorted(por_tipo.items())))
@@ -1130,6 +1169,11 @@ def prueba_photorec(d):
         if not archivos and p.returncode not in (0, None) and not detenido:
             r["comprobaciones"][-1]["resultado"] = "PhotoRec terminó con código %s" % p.returncode
             r["comprobaciones"][-1]["ok"] = False
+        r["comprobaciones"].append({
+            "nombre": "Coincidencias descartadas por no contener datos",
+            "resultado": ("%d (contenido formado solo por ceros u otro byte repetido; no es información "
+                          "recuperable)" % descartados) if descartados else "0",
+            "ok": True})
         r["estado"] = "Aprobada" if all(c["ok"] for c in r["comprobaciones"]) else "Fallida"
         r["log_resumen"] = ["%s: %s/%s" % x for x in resumen_log]
     finally:
@@ -1209,9 +1253,10 @@ opcional. Certificado de referencia: <b class="mono">{{FOLIO_CERT}}</b></div>
 (wipefs) y lee el primer 512 MiB, los últimos 64 MiB y {{MUESTRAS}} bloques aleatorios de 64 KiB buscando
 estructuras de NTFS, BitLocker, FAT/exFAT, GPT y tabla MFT, así como cabeceras de archivos comunes (PDF,
 Office, Outlook, imágenes, comprimidos, registro de Windows, bases SQLite, video).<br>
-<b>Prueba completa:</b> PhotoRec (CGSecurity) recorre todo el disco buscando más de 400 tipos de archivo
-por su contenido, sin depender del sistema de archivos. Lo recuperado se guarda solo en memoria RAM y se
-elimina al terminar; únicamente se registra la cantidad y el tipo.<br>
+<b>Prueba completa:</b> PhotoRec (CGSecurity) recorre todo el disco buscando cientos de tipos de archivo
+por su contenido (firmas predeterminadas), sin depender del sistema de archivos. Lo recuperado se guarda solo
+en memoria RAM y se elimina al terminar; únicamente se registra la cantidad y el tipo. Las coincidencias cuyo
+contenido es solo un byte repetido (por ejemplo, puros ceros) se descartan, porque no contienen información.<br>
 Resultado esperado tras un borrado correcto: ninguna firma y 0 archivos recuperados.
 </div>
 <div class="footer">Folio de evidencia: <span class="mono">{{FOLIO}}</span> &middot; Certificado de referencia: <span class="mono">{{FOLIO_CERT}}</span><br>
