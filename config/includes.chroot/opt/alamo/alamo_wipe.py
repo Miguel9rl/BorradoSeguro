@@ -47,7 +47,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 MEDIO_LIVE = "/run/live/medium"
 PUNTO_MONTAJE_EXTRA = "/mnt/alamo_usb"
 CARPETA_REPORTES = "Reportes_Borrado_Seguro"
@@ -264,11 +264,13 @@ def disco_padre(dispositivo):
 
 
 def disco_arranque():
-    """Disco fisico que contiene el sistema live (nunca debe ofrecerse para borrado)."""
+    """Disco fisico que contiene el sistema live (nunca debe ofrecerse para borrado).
+    Con 'toram' el medio ya no esta montado: tambien se excluye por montaje (discos_con_montajes),
+    porque preparar_destino monta la USB para guardar reportes."""
     rc, out, _ = run(["findmnt", "-n", "-o", "SOURCE", MEDIO_LIVE])
-    if rc != 0 or not out.strip():
+    fuente = out.strip().splitlines()[0] if rc == 0 and out.strip() else ""
+    if not fuente.startswith("/dev/"):
         return ""
-    fuente = out.strip().splitlines()[0]
     return disco_padre(fuente) or fuente
 
 
@@ -286,8 +288,10 @@ def probar_escritura(directorio):
 
 def preparar_destino():
     """Devuelve (raiz_usb, es_usb). La raiz contiene alamo-wipe.conf y la carpeta de reportes."""
-    # 1) El propio medio live (Rufus en modo ISO = FAT32 escribible).
-    if os.path.ismount(MEDIO_LIVE):
+    # 1) El propio medio live, solo si es la USB fisica (FAT32/exFAT/NTFS). Con 'toram' el sistema
+    #    corre desde RAM y este punto puede no existir o ser memoria: entonces se usa el paso 2.
+    tipo_medio = run(["findmnt", "-n", "-o", "FSTYPE", MEDIO_LIVE])[1].strip()
+    if os.path.ismount(MEDIO_LIVE) and tipo_medio in ("vfat", "exfat", "ntfs", "ntfs3", "fuseblk"):
         run(["mount", "-o", "remount,rw", MEDIO_LIVE])
         if probar_escritura(os.path.join(MEDIO_LIVE, CARPETA_REPORTES)):
             return MEDIO_LIVE, True
@@ -301,6 +305,7 @@ def preparar_destino():
                 yield n, tran
                 for h in recorrer(n.get("children") or [], tran):
                     yield h
+        candidatos = []
         for i, (n, tran) in enumerate(recorrer(datos.get("blockdevices", []))):
             if n.get("type") != "part" or tran != "usb":
                 continue
@@ -312,6 +317,11 @@ def preparar_destino():
                 tipo = "ntfs3" if n["fstype"] == "ntfs" else n["fstype"]
                 if run(["mount", "-t", tipo, "-o", "rw", n["name"], punto])[0] != 0:
                     continue
+            # Preferir la USB de arranque (tiene alamo-wipe.conf o la carpeta live/).
+            prioridad = 0 if os.path.isfile(os.path.join(punto, NOMBRE_CONF)) else (
+                1 if os.path.isdir(os.path.join(punto, "live")) else 2)
+            candidatos.append((prioridad, punto))
+        for _, punto in sorted(candidatos):
             if probar_escritura(os.path.join(punto, CARPETA_REPORTES)):
                 return punto, True
     # 3) Sin USB escribible: solo memoria RAM (se pierde al apagar).

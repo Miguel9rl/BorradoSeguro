@@ -17,5 +17,5 @@ lb config noauto \
   --iso-application "Alamo Borrado Seguro" \
   --iso-publisher "Alamo Seguros TI" \
   --iso-volume "ALAMO_WIPE" \
-  --bootappend-live "boot=live components loglevel=4 systemd.show_status=true noprompt locales=es_MX.UTF-8 keyboard-layouts=latam timezone=America/Mexico_City utc=no" \
+  --bootappend-live "boot=live components toram loglevel=4 systemd.show_status=true noprompt locales=es_MX.UTF-8 keyboard-layouts=latam timezone=America/Mexico_City utc=no" \
   "${@}"

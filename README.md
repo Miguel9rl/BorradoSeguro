@@ -36,16 +36,31 @@ Para incluir el logotipo en la imagen, coloque `logo.png` junto a `build-iso.sh`
 
 > La URL del webhook **no** va dentro de la ISO: se configura en la USB. Así la ISO puede compartirse sin exponer la credencial.
 
-## 2. Preparar la USB (Rufus, en Windows)
+## 2. Preparar la USB (Windows)
 
-1. Rufus → seleccione la ISO.
-2. **Esquema de partición: GPT** · **Sistema destino: UEFI (no CSM)** · Sistema de archivos: **FAT32**.
-3. Al pulsar *Empezar*, si pregunta, elija **"Escribir en modo Imagen ISO (Recomendado)"** — *no* modo DD. El modo ISO deja la USB en FAT32 escribible, donde se guardan los certificados.
-4. Copie a la **raíz** de la USB:
-   - `usb/alamo-wipe.conf` con `webhook_url` llenado,
-   - `logo.png` (opcional).
+Use una USB de **8 GB o más**, de marca conocida. Las memorias viejas pueden corromper archivos al grabar y el sistema falla con `SQUASHFS error` o `Application failed, r = 1`.
 
-No use Ventoy: obliga a registrar una llave MOK en cada equipo para arrancar con Secure Boot.
+1. **Formatear:** Rufus → *Elección de arranque*: **No auto-ejecutable** · *Esquema*: **GPT** · *Sistema de archivos*: **FAT32** · *Etiqueta*: `ALAMO_WIPE` → Empezar.
+2. **Montar la ISO:** doble clic en `alamo-borrado-seguro-AAAAMMDD.iso` (aparece como otra unidad, p. ej. `E:`).
+3. **Copiar todo** (incluye carpetas ocultas), en PowerShell:
+   ```powershell
+   robocopy E:\ D:\ /E /COPY:DT /R:1 /W:1
+   ```
+4. Expulsar la ISO y copiar a la raíz de la USB `usb/alamo-wipe.conf` (con `webhook_url`) y, opcional, `logo.png`.
+5. **Verificar** que la USB quedó idéntica a la ISO (debe decir solo "Verificación terminada"):
+   ```powershell
+   cd D:\
+   Get-Content .\sha256sum.txt | ForEach-Object {
+     $h, $f = $_ -split '\s+', 2; $f = ($f -replace '^\./', '') -replace '/', '\'
+     if (-not (Test-Path -LiteralPath $f)) { "FALTA: $f" }
+     elseif ((Get-FileHash -LiteralPath $f -Algorithm SHA256).Hash -ne $h.ToUpper()) { "DAÑADO: $f" }
+   }; "Verificación terminada"
+   ```
+   Si aparece `DAÑADO` o `FALTA`, cambie de USB y repita.
+
+No grabe la ISO con Rufus en modo *Imagen ISO* aceptando la descarga de archivos de GRUB/Syslinux: Rufus reemplaza el cargador y el kernel no arranca. No use Ventoy: obliga a registrar una llave MOK en cada equipo para arrancar con Secure Boot.
+
+Al arrancar, el sistema se copia completo a la memoria RAM (`toram`, ~30 s). Después ya no lee programas de la USB; solo la usa para guardar reportes.
 
 ## 3. Uso en campo
 
