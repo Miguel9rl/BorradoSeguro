@@ -47,7 +47,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 MEDIO_LIVE = "/run/live/medium"
 PUNTO_MONTAJE_EXTRA = "/mnt/alamo_usb"
 CARPETA_REPORTES = "Reportes_Borrado_Seguro"
@@ -785,7 +785,9 @@ def descongelar_ata(d):
     LOG.aviso("Disco FROZEN: suspendiendo 8 s para que el disco se reinicie (modos: %s)." % (modos or "N/D"))
     if "deep" not in modos:
         LOG.aviso("Este equipo no anuncia suspensión S3 ('deep'); puede seguir congelado.")
+    registrar_drivers_red()
     run(["rtcwake", "-m", "mem", "-s", "8"], timeout=90)
+    ESTADO_RED["suspendido"] = True
     time.sleep(6)
     analizar_ata(d)
     return not d.get("ata", {}).get("congelado", True)
@@ -1791,6 +1793,54 @@ def _campos_nmcli(linea):
     return [c.replace("\\:", ":").replace("\\\\", "\\") for c in campos]
 
 
+# Modulos (drivers) de las tarjetas de red Wi-Fi, registrados mientras funcionan. Tras una suspension
+# (rtcwake, para desbloquear discos SATA "frozen") algunas tarjetas Intel no se reinician y la interfaz
+# desaparece; con esta lista se puede recargar el driver aunque la interfaz ya no exista.
+MODULOS_WIFI = set()
+ESTADO_RED = {"suspendido": False}
+
+
+def registrar_drivers_red():
+    base = "/sys/class/net"
+    for iface in (os.listdir(base) if os.path.isdir(base) else []):
+        if os.path.isdir(os.path.join(base, iface, "wireless")):
+            mod = os.path.realpath(os.path.join(base, iface, "device", "driver", "module"))
+            if os.path.isdir(mod):
+                MODULOS_WIFI.add(os.path.basename(mod))
+
+
+def reiniciar_adaptadores():
+    """Recarga los drivers Wi-Fi y reinicia NetworkManager; NM reconecta solo a la red Wi-Fi ya guardada."""
+    registrar_drivers_red()
+    LOG.aviso("Reiniciando adaptadores de red (drivers: %s)..." % (", ".join(sorted(MODULOS_WIFI)) or "N/D"))
+    run(["nmcli", "networking", "off"])
+    for mod in sorted(MODULOS_WIFI):
+        # Intel: iwlwifi depende de iwlmvm/iwldvm; hay que quitar primero esos.
+        quitar = ["iwlmvm", "iwldvm", "iwlwifi"] if mod in ("iwlwifi", "iwlmvm", "iwldvm") else [mod]
+        run(["modprobe", "-r"] + quitar, timeout=60)
+    time.sleep(2)
+    for mod in sorted(MODULOS_WIFI):
+        run(["modprobe", "iwlwifi" if mod in ("iwlmvm", "iwldvm") else mod], timeout=60)
+    time.sleep(3)
+    run(["rfkill", "unblock", "all"])
+    run(["nmcli", "networking", "on"])
+    run(["nmcli", "radio", "wifi", "on"])
+
+
+def restablecer_red(conf, espera=20):
+    """Espera la conexion; si no vuelve, reinicia adaptadores y espera de nuevo."""
+    print("Comprobando conexión...")
+    if esperar_red(conf, espera):
+        return True
+    reiniciar_adaptadores()
+    print("Esperando que la red se reconecte (hasta 40 s)...")
+    if esperar_red(conf, 40):
+        LOG.ok("Conexión restablecida.")
+        ESTADO_RED["suspendido"] = False
+        return True
+    return False
+
+
 def interfaces_wifi():
     rc, out, _ = run(["nmcli", "-t", "-f", "DEVICE,TYPE,STATE", "device"])
     return [c[0] for c in (_campos_nmcli(l) for l in out.splitlines()) if len(c) >= 2 and c[1] == "wifi"]
@@ -1801,6 +1851,10 @@ def conectar_wifi(ui):
     run(["rfkill", "unblock", "wifi"])
     run(["nmcli", "radio", "wifi", "on"])
     time.sleep(2)
+    if not interfaces_wifi() and MODULOS_WIFI:
+        reiniciar_adaptadores()
+        time.sleep(5)
+    registrar_drivers_red()
     if not interfaces_wifi():
         ui.mensaje("Wi-Fi", "No se detectó una tarjeta Wi-Fi utilizable.\n\nPuede faltar el driver o firmware "
                    "de este modelo, o el Wi-Fi estar apagado en la BIOS. Use cable de red o un adaptador "
@@ -1856,6 +1910,36 @@ def conectar_wifi(ui):
             return False
 
 
+def asegurar_red_para_envio_texto():
+    return ("No hay conexión para enviar el certificado a Power Automate." +
+            ("\nEl equipo se suspendió unos segundos para desbloquear el disco SATA; la tarjeta Wi-Fi "
+             "puede necesitar reiniciarse." if ESTADO_RED["suspendido"] else ""))
+
+
+def asegurar_red_envio(ui, conf):
+    """Antes de dejar el certificado pendiente: reintenta la red (reiniciando la tarjeta si hace falta)
+    y, si sigue sin conexion, deja elegir al tecnico."""
+    if hay_red(conf) or esperar_red(conf, 10):
+        return True
+    LOG.aviso("Sin conexión al terminar; intentando restablecer la red...")
+    if restablecer_red(conf, 5):
+        return True
+    while ui.interactiva:
+        op = ui.menu("Enviar certificado", asegurar_red_para_envio_texto(),
+                     [("1", "Reintentar (reinicia la tarjeta de red y reconecta)"),
+                      ("2", "Conectar a Wi-Fi"),
+                      ("3", "Dejar pendiente en la USB (se envía en el próximo arranque con red)")], 15, 96)
+        if op == "1":
+            if restablecer_red(conf, 10):
+                return True
+        elif op == "2":
+            if conectar_wifi(ui) and esperar_red(conf, 20):
+                return True
+        else:
+            return False
+    return False
+
+
 def pantalla_red(ui, raiz, conf):
     if not conf.get("webhook_url", "").strip():
         ui.mensaje("Red", "No hay webhook_url en alamo-wipe.conf.\n\nLos certificados se guardarán solo en la USB.", 10)
@@ -1866,11 +1950,10 @@ def pantalla_red(ui, raiz, conf):
     while True:
         op = ui.menu("Conexión a la red",
                      "No hay conexión con Power Automate (%s).\nConecte el cable de red o configure Wi-Fi." % host_webhook(conf),
-                     [("1", "Reintentar (cable Ethernet conectado)"), ("2", "Conectar a Wi-Fi"),
+                     [("1", "Reintentar (reinicia la tarjeta de red y reconecta)"), ("2", "Conectar a Wi-Fi"),
                       ("3", "Continuar sin red (el envío queda pendiente en la USB)")], 14)
         if op == "1":
-            print("Esperando conexión...")
-            if esperar_red(conf, 20):
+            if restablecer_red(conf, 10):
                 return True
         elif op == "2":
             if conectar_wifi(ui):
@@ -1996,7 +2079,6 @@ def flujo_borrado(ui, raiz, es_usb, conf, equipo, simulacion, discos_cli=None, c
             print("=" * 78)
             pruebas = ejecutar_pruebas(borrados, tipo)
 
-    red = hay_red(conf)
     equipo["ntp"] = "sí" if hora_sincronizada() else "no"
     LOG.paso("Generando certificado...")
     ruta_pdf, ruta_json, datos, global_ = generar_certificado(raiz, conf, equipo, resultados,
@@ -2006,6 +2088,9 @@ def flujo_borrado(ui, raiz, es_usb, conf, equipo, simulacion, discos_cli=None, c
     envio = "No aplica (simulación)"
     if not simulacion and ruta_pdf.endswith(".pdf"):
         payload = armar_payload(conf, datos, ruta_pdf)
+        red = False
+        if conf.get("webhook_url", "").strip():
+            red = asegurar_red_envio(ui, conf)
         if not conf.get("webhook_url", "").strip():
             envio = "Sin webhook configurado (solo USB)"
         elif red:
@@ -2064,6 +2149,7 @@ def prueba_desde_menu(ui, raiz, conf, equipo):
 
 def menu_principal(ui, raiz, es_usb, conf):
     equipo = info_equipo()
+    registrar_drivers_red()
     run(["setterm", "--blank", "0", "--powerdown", "0"])
     run(["dmesg", "-n", "1"])
     ui.mensaje("Bienvenido",
