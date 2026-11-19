@@ -47,7 +47,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-VERSION = "1.1.2"
+VERSION = "1.2.0"
 MEDIO_LIVE = "/run/live/medium"
 PUNTO_MONTAJE_EXTRA = "/mnt/alamo_usb"
 CARPETA_REPORTES = "Reportes_Borrado_Seguro"
@@ -969,7 +969,7 @@ FIRMAS_ARCHIVO = [
 REGION_INICIO = 512 * 1024 * 1024      # GPT, particion EFI, MSR e inicio de la particion de Windows
 REGION_FINAL = 64 * 1024 * 1024        # GPT de respaldo y particion de recuperacion
 MUESTRAS_RAPIDA = 2048                 # bloques aleatorios de 64 KiB (~128 MiB)
-LIMITE_PHOTOREC_ARCHIVOS = 200         # si se recuperan mas, se detiene: el resultado ya es "Fallida"
+LIMITE_PHOTOREC_ARCHIVOS = 200         # si se recuperan mas, se detiene: ya hay hallazgos que reportar
 LIMITE_PHOTOREC_BYTES = 512 * 1024 * 1024
 VELOCIDAD_MB_S = {"NVMe": 1500, "SATA SSD": 450, "SATA HDD": 120}
 
@@ -1075,7 +1075,7 @@ def prueba_rapida(d):
     r["leido"] = leidos
     r["contenido"] = "%.0f %% en ceros, %.0f %% con otro contenido (aleatorio o datos)" % (
         ceros * 100.0 / max(leidos, 1), 100 - ceros * 100.0 / max(leidos, 1))
-    r["estado"] = "Aprobada" if all(c["ok"] for c in r["comprobaciones"]) else "Fallida"
+    r["estado"] = "Sin hallazgos" if all(c["ok"] for c in r["comprobaciones"]) else "Con hallazgos"
     r["duracion"] = duracion(time.time() - t0)
     r["herramienta"] = "Análisis propio (alamo_wipe %s) + wipefs" % VERSION
     return r
@@ -1174,7 +1174,7 @@ def prueba_photorec(d):
             "resultado": ("%d (contenido formado solo por ceros u otro byte repetido; no es información "
                           "recuperable)" % descartados) if descartados else "0",
             "ok": True})
-        r["estado"] = "Aprobada" if all(c["ok"] for c in r["comprobaciones"]) else "Fallida"
+        r["estado"] = "Sin hallazgos" if all(c["ok"] for c in r["comprobaciones"]) else "Con hallazgos"
         r["log_resumen"] = ["%s: %s/%s" % x for x in resumen_log]
     finally:
         shutil.rmtree(tmp, ignore_errors=True)   # nada recuperado sale de la memoria
@@ -1189,19 +1189,37 @@ def ejecutar_pruebas(discos, tipo):
         pruebas = []
         if tipo in ("rapida", "ambas"):
             pruebas.append(prueba_rapida(d))
-            (LOG.ok if pruebas[-1]["estado"] == "Aprobada" else LOG.err)(
+            (LOG.ok if pruebas[-1]["estado"] == "Sin hallazgos" else LOG.aviso)(
                 "Prueba rápida: %s (%s)" % (pruebas[-1]["estado"], pruebas[-1]["duracion"]))
         if tipo in ("completa", "ambas"):
             LOG.info("PhotoRec leerá todo el disco. Tiempo estimado: %s." % tiempo_estimado(d))
             pruebas.append(prueba_photorec(d))
-            (LOG.ok if pruebas[-1]["estado"] == "Aprobada" else LOG.err)(
+            (LOG.ok if pruebas[-1]["estado"] == "Sin hallazgos" else LOG.aviso)(
                 "PhotoRec: %s, %s archivo(s) recuperado(s) (%s)" % (pruebas[-1]["estado"],
                                                                   pruebas[-1].get("archivos", "?"), pruebas[-1]["duracion"]))
         resultados.append({"ruta": d["ruta"], "clase": d.get("clase", ""), "modelo": d.get("modelo", ""),
                            "serie": d.get("serie", ""), "tam": d.get("tam", 0), "pruebas": pruebas,
-                           "estado": "Aprobada" if all(p["estado"] == "Aprobada" for p in pruebas) else
-                           ("No disponible" if all(p["estado"] == "No disponible" for p in pruebas) else "Fallida")})
+                           "estado": estado_pruebas(pruebas), "tipo_prueba": tipo})
     return resultados
+
+
+def estado_pruebas(pruebas):
+    if pruebas and all(p["estado"] == "No disponible" for p in pruebas):
+        return "No disponible"
+    return "Con hallazgos" if any(p["estado"] == "Con hallazgos" for p in pruebas) else "Sin hallazgos"
+
+
+def resumen_prueba(rp):
+    """Texto corto de una prueba de recuperacion de un disco (pantalla, payload y certificado)."""
+    partes = []
+    for p in rp.get("pruebas", []):
+        if "PhotoRec" in p["tipo"]:
+            tipos = ", ".join("%s: %d" % kv for kv in sorted((p.get("por_tipo") or {}).items()))
+            det = "%s archivo(s)%s" % (p.get("archivos", 0), " (%s)" % tipos if tipos else "")
+        else:
+            det = "; ".join(c["resultado"] for c in p.get("comprobaciones", []) if not c["ok"]) or "sin firmas"
+        partes.append("%s: %s - %s" % (p["tipo"], p["estado"], det))
+    return " | ".join(partes)
 
 
 PLANTILLA_EVIDENCIA = r"""<!DOCTYPE html>
@@ -1269,7 +1287,7 @@ def html_evidencia_disco(i, r):
     filas = ""
     for p in r["pruebas"]:
         comps = "".join("<tr><td>%s</td><td>%s</td><td>%s</td></tr>" % (
-            esc(c["nombre"]), esc(c["resultado"]), badge("Correcto" if c["ok"] else "Falló"))
+            esc(c["nombre"]), esc(c["resultado"]), badge("Sin hallazgos" if c["ok"] else "Hallazgo"))
             for c in p.get("comprobaciones", []))
         extra = ""
         if p.get("contenido"):
@@ -1290,7 +1308,7 @@ def html_evidencia_disco(i, r):
 def generar_evidencia(raiz, conf, equipo, resultados, folio_cert):
     ahora = dt.datetime.now()
     folio = str(uuid.uuid4()).upper()
-    global_ = "Aprobada" if resultados and all(r["estado"] == "Aprobada" for r in resultados) else "Fallida"
+    global_ = "Con hallazgos" if any(r["estado"] == "Con hallazgos" for r in resultados) else "Sin hallazgos"
     datos = {"version": VERSION, "tipo": "EvidenciaRecuperacion", "folio": folio, "certificado_referencia": folio_cert,
              "fecha": ahora.strftime("%Y-%m-%d %H:%M:%S"), "resultado": global_,
              "equipo": {k: equipo.get(k) for k in ("fabricante", "modelo", "serie")}, "discos": resultados}
@@ -1325,6 +1343,10 @@ def generar_evidencia(raiz, conf, equipo, resultados, folio_cert):
     return ruta, global_
 
 
+AVISO_HALLAZGOS = ("\n\nSe encontraron datos o estructuras en el disco. Recomendación: repita el borrado "
+                   "(opción 1 del menú) y vuelva a realizar la prueba.")
+
+
 def menu_prueba(ui, discos, permitir_omitir=True):
     est = ", ".join("%s ~%s" % (os.path.basename(d["ruta"]), tiempo_estimado(d)) for d in discos)
     opciones = [("1", "Rápida (~1 min): particiones, firmas y cabeceras de archivos"),
@@ -1333,8 +1355,10 @@ def menu_prueba(ui, discos, permitir_omitir=True):
     if permitir_omitir:
         opciones.append(("4", "No realizar prueba"))
     op = ui.menu("Prueba de recuperación (opcional)",
-                 "Evidencia adicional en un documento aparte; no modifica el certificado.\n"
-                 "Las pruebas solo leen el disco.\nTiempo estimado de la completa: %s" % est, opciones, 16, 86)
+                 ("El resultado se agrega al certificado como hoja de evidencia; no cambia el resultado "
+                  "del borrado.\n" if permitir_omitir else
+                  "El resultado se guarda en un documento aparte (el certificado ya fue emitido).\n") +
+                 "Las pruebas solo leen el disco.\nTiempo estimado de la completa: %s" % est, opciones, 16, 96)
     return {"1": "rapida", "2": "completa", "3": "ambas"}.get(op)
 
 
@@ -1346,16 +1370,12 @@ def flujo_prueba(ui, raiz, conf, equipo, discos, tipo, folio_cert):
     resultados = ejecutar_pruebas(discos, tipo)
     ruta, global_ = generar_evidencia(raiz, conf, equipo, resultados, folio_cert)
     LOG.ok("Evidencia: %s" % ruta)
-    lineas = []
-    for r in resultados:
-        for p in r["pruebas"]:
-            det = ("%s archivo(s) recuperado(s)" % p.get("archivos", 0)) if "PhotoRec" in p["tipo"] else (
-                "; ".join(c["resultado"] for c in p["comprobaciones"] if not c["ok"]) or "sin firmas")
-            lineas.append("%s  %-20s %s - %s" % (r["ruta"], p["tipo"], p["estado"], det[:60]))
+    lineas = ["%s  %s" % (r["ruta"], resumen_prueba(r))[:150] for r in resultados]
     ui.pausa("Prueba terminada. Presione Enter para ver el resumen...")
     ui.mensaje("Prueba de recuperación: %s" % global_,
-               "%s\n\nDocumento: %s\n(Guardado en la USB; no se envía a Power Automate.)" % (
-                   "\n".join(lineas), os.path.basename(ruta)), 18, 100)
+               "%s%s\n\nDocumento: %s\n(Guardado en la USB; no se envía a Power Automate.)" % (
+                   "\n".join(lineas), AVISO_HALLAZGOS if global_ == "Con hallazgos" else "",
+                   os.path.basename(ruta)), 18, 110)
     return global_
 
 
@@ -1451,6 +1471,7 @@ los datos completos de este certificado (archivo JSON adjunto) y se registra en 
 {{ETIQUETA_HUELLA}}: <span class="mono">{{HUELLA}}</span><br>
 alamo_wipe.py v{{VERSION}} &middot; Debian Live &middot; {{SERIE}}</div>
 </div>
+{{PRUEBA}}
 </body></html>
 """
 
@@ -1460,7 +1481,8 @@ def esc(v):
 
 
 def badge(estado):
-    clase = {"Exitoso": "ok", "Aprobada": "ok", "Correcto": "ok", "Fallido": "err", "Fallida": "err",
+    clase = {"Sin hallazgos": "ok", "Con hallazgos": "warn", "Hallazgo": "warn",
+             "Exitoso": "ok", "Aprobada": "ok", "Correcto": "ok", "Fallido": "err", "Fallida": "err",
              "Falló": "err", "Parcial": "warn", "No concluyente": "warn", "Simulación": "sim"}.get(estado, "neutral")
     return '<span class="badge %s">%s</span>' % (clase, esc(estado))
 
@@ -1532,11 +1554,35 @@ def huella(datos, clave_hmac):
     return "SHA-256", hashlib.sha256(canon).hexdigest()
 
 
-def generar_certificado(raiz, conf, equipo, resultados, excluidos, simulacion):
+def html_hoja_prueba(pruebas):
+    """Hoja de evidencia dentro del certificado. Informa lo encontrado; no cambia el resultado del borrado."""
+    if not pruebas:
+        return ""
+    estado = "Con hallazgos" if any(r["estado"] == "Con hallazgos" for r in pruebas) else "Sin hallazgos"
+    rec = ('<div class="aviso" style="text-align:left">Se encontraron datos o estructuras en al menos un disco. '
+           'Recomendación: repetir el borrado del disco y volver a realizar la prueba de recuperación.</div>'
+           if estado == "Con hallazgos" else "")
+    return """<div style="page-break-before: always;"></div>
+<h2>Evidencia: prueba de recuperación de datos</h2>
+<p class="lead">Prueba realizada después del borrado, solo lectura. Informa lo que se encontró en el disco;
+no modifica el resultado del borrado. Resultado de la prueba: %s</p>%s
+%s
+<div class="metodologia" style="margin-top:8px">
+<b>Prueba rápida:</b> comprueba que el sistema no detecte particiones ni firmas (wipefs) y lee el primer 512 MiB,
+los últimos 64 MiB y %d bloques aleatorios de 64 KiB buscando estructuras de NTFS, BitLocker, FAT/exFAT, GPT y
+MFT, y cabeceras de archivos comunes (PDF, Office, Outlook, imágenes, comprimidos, registro de Windows, SQLite,
+video). <b>Prueba completa:</b> PhotoRec (CGSecurity) recorre todo el disco buscando archivos por su contenido
+(firmas predeterminadas). Lo recuperado se guarda solo en RAM y se elimina; se registra únicamente cantidad y tipo.
+Las coincidencias formadas solo por un byte repetido (p. ej. puros ceros) se descartan por no contener información.
+</div>""" % (badge(estado), rec, "".join(html_evidencia_disco(i + 1, r) for i, r in enumerate(pruebas)),
+             MUESTRAS_RAPIDA)
+
+
+def generar_certificado(raiz, conf, equipo, resultados, excluidos, simulacion, pruebas=None):
     global_ = estado_global(resultados, simulacion)
     equipo["fecha_fin"] = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     datos = {"version": VERSION, "tipo": "BorradoSeguro", "simulacion": simulacion, "resultado": global_,
-             "equipo": equipo, "discos": resultados,
+             "equipo": equipo, "discos": resultados, "prueba_recuperacion": pruebas or [],
              "excluidos": [{k: e[k] for k in ("ruta", "modelo", "serie", "motivo")} for e in excluidos]}
     etiqueta, valor = huella(datos, conf.get("clave_hmac", ""))
     datos["huella"] = {"algoritmo": etiqueta, "valor": valor}
@@ -1563,6 +1609,7 @@ def generar_certificado(raiz, conf, equipo, resultados, excluidos, simulacion):
         "{{VERSION}}": VERSION,
         "{{EXCLUIDOS}}": html_excluidos(excluidos),
         "{{DISCOS}}": "".join(html_disco(i + 1, r) for i, r in enumerate(resultados)),
+        "{{PRUEBA}}": html_hoja_prueba(pruebas),
     }
     doc = PLANTILLA
     for k, v in valores.items():
@@ -1663,6 +1710,8 @@ def armar_payload(conf, datos, ruta_pdf):
         "folio": eq["folio"],
         "huella": datos["huella"]["valor"],
         "hashPdf": hashlib.sha256(contenido).hexdigest(),
+        "pruebaRecuperacion": (" || ".join("%s: %s" % (rp["ruta"], resumen_prueba(rp))
+                                           for rp in datos.get("prueba_recuperacion") or []) or "No realizada"),
     }
 
 
@@ -1930,11 +1979,28 @@ def flujo_borrado(ui, raiz, es_usb, conf, equipo, simulacion, discos_cli=None, c
     run(["dmesg", "-n", "1"])
     resultados = [borrar_disco(d, conf, simulacion) for d in seleccion]
 
+    # Prueba de recuperacion opcional ANTES del certificado: su resultado va en el mismo PDF (hoja de
+    # evidencia). Solo informa lo encontrado; no cambia el resultado del borrado.
+    pruebas = []
+    borrados = [d for d, r in zip(seleccion, resultados) if r.get("metodo_id")]
+    if not simulacion and borrados:
+        estados = "\n".join("  %s  %s  ->  %s" % (r["ruta"], r["modelo"] or "?", r["estado"]) for r in resultados)
+        if ui.interactiva:
+            ui.pausa("Borrado terminado. Presione Enter para continuar...")
+            ui.mensaje("Borrado terminado", "Resultado del borrado:\n%s\n\nA continuación puede realizar una "
+                       "prueba de recuperación opcional antes de emitir el certificado." % estados, 14, 96)
+        tipo = prueba_cli or (menu_prueba(ui, borrados) if ui.interactiva else None)
+        if tipo:
+            print("=" * 78)
+            print("  PRUEBA DE RECUPERACIÓN (solo lectura)")
+            print("=" * 78)
+            pruebas = ejecutar_pruebas(borrados, tipo)
+
     red = hay_red(conf)
     equipo["ntp"] = "sí" if hora_sincronizada() else "no"
     LOG.paso("Generando certificado...")
     ruta_pdf, ruta_json, datos, global_ = generar_certificado(raiz, conf, equipo, resultados,
-                                                              excluidos + no_seleccionados, simulacion)
+                                                              excluidos + no_seleccionados, simulacion, pruebas)
     LOG.ok("Certificado: %s" % ruta_pdf)
 
     envio = "No aplica (simulación)"
@@ -1962,19 +2028,17 @@ def flujo_borrado(ui, raiz, es_usb, conf, equipo, simulacion, discos_cli=None, c
         pass
 
     lineas = ["%s  %s  ->  %s" % (r["ruta"], r["modelo"] or "?", r["estado"]) for r in resultados]
+    if pruebas:
+        lineas += ["", "Prueba de recuperación:"] + ["  %s  %s" % (rp["ruta"], resumen_prueba(rp))[:150]
+                                                     for rp in pruebas]
+    hallazgos = any(rp["estado"] == "Con hallazgos" for rp in pruebas)
     ui.pausa("Proceso terminado. Presione Enter para ver el resumen...")
     ui.mensaje("Resultado: %s" % global_,
-               "%s\n\nCertificado: %s\nEnvío: %s%s" % ("\n".join(lineas), os.path.basename(ruta_pdf), envio,
-                                                      "" if es_usb else "\n\n¡ATENCIÓN! No hay USB escribible: el "
-                                                      "certificado se perderá al apagar."), 18, 90)
-    # Prueba de recuperacion opcional: evidencia aparte, solo sobre discos donde se aplico un metodo.
-    folio_cert = equipo["folio"]
-    equipo["ultimo_folio_cert"] = folio_cert
-    borrados = [d for d, r in zip(seleccion, resultados) if r.get("metodo_id")]
-    if not simulacion and borrados:
-        tipo = prueba_cli or (menu_prueba(ui, borrados) if ui.interactiva else None)
-        if tipo:
-            flujo_prueba(ui, raiz, conf, equipo, borrados, tipo, folio_cert)
+               "%s%s\n\nCertificado: %s\nEnvío: %s%s" % (
+                   "\n".join(lineas), AVISO_HALLAZGOS if hallazgos else "", os.path.basename(ruta_pdf), envio,
+                   "" if es_usb else "\n\n¡ATENCIÓN! No hay USB escribible: el certificado se perderá al apagar."),
+               22, 110)
+    equipo["ultimo_folio_cert"] = equipo["folio"]
     # Nueva transaccion para el siguiente proceso en el mismo arranque.
     equipo.update({k: v for k, v in info_equipo().items() if k in ("folio", "fecha_inicio", "fecha_archivo")})
     return global_
@@ -2086,7 +2150,7 @@ def main():
             print("Disco no encontrado o excluido: %s" % ", ".join(args.disco))
             return 2
         r = flujo_prueba(ui, raiz, conf, equipo, sel, args.prueba, "N/D (prueba independiente del borrado)")
-        return 0 if r == "Aprobada" else 3
+        return 0 if r == "Sin hallazgos" else 3
     if args.disco:
         if not args.simulacion and args.confirmar != "BORRAR":
             print("Para borrar sin menú agregue --confirmar BORRAR")

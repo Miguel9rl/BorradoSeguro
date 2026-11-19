@@ -101,20 +101,22 @@ Las capacidades se leen como bits (`sanicap`, `fna`, `oacs` en NVMe; bloque *Sec
 
 **Estados**: *Exitoso* (método OK + verificación aprobada o no concluyente) · *Parcial* (sobrescritura en SSD) · *Fallido* (ningún método funcionó o la verificación detectó datos).
 
-## 4.1 Prueba de recuperación (opcional, evidencia aparte)
+## 4.1 Prueba de recuperación (opcional, en el mismo certificado)
 
-Al terminar un borrado real, la interfaz ofrece una prueba de recuperación. También está en el menú principal (**3 Prueba de recuperación**) para hacerla después. Ninguna de las dos pruebas escribe en el disco.
+Al terminar el borrado, y **antes de emitir el certificado**, la interfaz ofrece una prueba de recuperación: Rápida, Completa (PhotoRec), Ambas o No realizar. Ninguna escribe en el disco.
 
 | Prueba | Qué hace | Tiempo |
 |---|---|---|
 | **Rápida** | Sin particiones ni firmas (`wipefs`); lee el primer 512 MiB, los últimos 64 MiB y 2048 bloques aleatorios buscando NTFS, BitLocker, FAT/exFAT, GPT, MFT y cabeceras de PDF, Office, Outlook, imágenes, comprimidos, registro de Windows, SQLite y video | ~1 min |
-| **Completa** | PhotoRec sobre todo el disco (más de 400 tipos de archivo). Lo recuperado va solo a memoria RAM y se elimina; se registra únicamente cantidad y tipo. Se detiene sola si supera 200 archivos | NVMe 3–10 min · SSD SATA 10–20 min · HDD 1.5–3 h |
+| **Completa** | PhotoRec sobre todo el disco (firmas predeterminadas). Lo recuperado va solo a RAM y se elimina; se registra cantidad y tipo. Las coincidencias formadas solo por un byte repetido (p. ej. ceros) se descartan. Se detiene sola si supera 200 archivos | NVMe 3–10 min · SSD SATA 10–20 min · HDD 1.5–3 h |
 
-El resultado se guarda en la USB como `Evidencia_PruebaRecuperacion_<serie>_<fecha>.pdf` (+ `_datos.json`), con el folio del certificado de referencia. **No modifica el certificado ni se envía a Power Automate.** Resultado esperado tras un borrado correcto: ninguna firma y 0 archivos recuperados.
+Si se realiza, el resultado se agrega al **mismo PDF del certificado** como hoja "Evidencia: prueba de recuperación de datos" y se envía a Power Automate en un solo archivo (campo `pruebaRecuperacion`). La prueba **informa lo que encontró** ("Sin hallazgos" / "Con hallazgos") y **no cambia el resultado del borrado**. Si hay hallazgos, el certificado recomienda repetir el borrado y la prueba.
+
+La opción **3 Prueba de recuperación** del menú sirve para probar un disco en otro momento (por ejemplo, después de repetir el borrado). Como ese certificado ya se emitió, genera un documento aparte: `Evidencia_PruebaRecuperacion_<serie>_<fecha>.pdf`.
 
 ## 5. Power Automate
 
-Se envía el mismo esquema del sistema de reasignación (`hostname`, `serie`, `modelo`, `tecnico`, `usuarios`, `fecha`, `nombreArchivo`, `archivoBase64`) y además `tipo` (`BorradoSeguro`), `resultado`, `folio`, `huella` y `hashPdf`. El disparador HTTP acepta campos adicionales, así que el flujo actual funciona sin cambios. Para aprovecharlos, agregue al esquema esos campos y columnas en la lista (o use una lista aparte para borrados).
+Se envía el mismo esquema del sistema de reasignación (`hostname`, `serie`, `modelo`, `tecnico`, `usuarios`, `fecha`, `nombreArchivo`, `archivoBase64`) y además `tipo` (`BorradoSeguro`), `resultado`, `folio`, `huella`, `hashPdf` y `pruebaRecuperacion`. El disparador HTTP acepta campos adicionales, así que el flujo actual funciona sin cambios. Para aprovecharlos, agregue al esquema esos campos y columnas en la lista (o use una lista aparte para borrados).
 
 - `hostname` lleva el valor de `etiqueta_hostname` (el equipo ya no tiene sistema operativo).
 - `usuarios` lleva el resumen de discos: `ruta modelo S/N serie: estado (método)`.
@@ -140,7 +142,7 @@ Debe coincidir con el PDF y con la columna `huella` registrada en SharePoint.
 
 1. En 2–3 modelos Dell distintos (uno viejo y uno reciente), arrancar y ejecutar **3 Diagnóstico**. Revisar el `.txt`: Secure Boot, discos detectados, métodos y estado *frozen*.
 2. Ejecutar **2 Simulación** y revisar el PDF y el log.
-3. Borrado real en un equipo de prueba con archivos reconocibles y, al terminar, elegir la prueba **Ambas**: debe dar 0 firmas y 0 archivos recuperados.
+3. Borrado real en un equipo de prueba con archivos reconocibles y, al terminar, elegir la prueba **Ambas**: la hoja de evidencia del certificado debe decir "Sin hallazgos".
 4. Probar sin red → arrancar con red → confirmar que el pendiente llega a SharePoint.
 
 ## Modo línea de comandos (desde la consola de soporte)
